@@ -1,0 +1,270 @@
+// js/app.js — PeerFlow v2
+import { syncNow, scheduleSync, onSyncEvent, isOnline, checkServerConnection, getPendingCount, pullFromServer } from './sync/sync-service.js';
+import { SyncQueueRepo } from './repos/repos.js';
+import * as EditorViews   from './ui/views-editor.js';
+import * as AuthorViews   from './ui/views-author.js';
+import * as ReviewerViews from './ui/views-reviewer.js';
+
+// ── SESIÓN ───────────────────────────────────────────────────────────────
+// Objeto compartido: todos los módulos importan la misma referencia,
+// así getCurrentUser() siempre devuelve el valor actualizado.
+export const session = { role: null, user: null };
+
+export function getCurrentUser() { return session.user; }
+
+export function setCurrentUser(u) {
+  session.user = u;
+  const userLabel = document.getElementById('userLabel');
+  if (userLabel && u) userLabel.textContent = u.name;
+}
+
+// Alias legacy (usados en otros módulos que aún los referencian)
+export let currentRole = null;
+export let currentUser = null;   // ⚠ lee siempre desde session.user vía getCurrentUser()
+
+// ── USUARIOS DEMO ─────────────────────────────────────────────────────────
+const DEMO_USERS = {
+  editor:   { id: 'editor_1', name: 'Dr. Ramírez',      label: '📋 Editor' },
+  author:   { id: 'author_1', name: 'M. González',       label: '✍️ Autor' },
+  reviewer: { id: 'rev_1',    name: 'Dra. Ana Martínez', label: '🔬 Revisor' },
+};
+
+const NAV_ITEMS = {
+  editor:   [
+    { view: 'dashboard', label: 'Tablero' },
+    { view: 'reviewers', label: 'Revisores' },
+  ],
+  author:   [
+    { view: 'my-articles',  label: 'Mis Artículos' },
+    { view: 'article-form', label: '+ Nuevo artículo' },
+  ],
+  reviewer: [
+    { view: 'my-reviews',     label: 'Mis Revisiones' },
+    { view: 'review-history', label: 'Historial' },
+  ],
+};
+
+const DEFAULT_VIEW = { editor: 'dashboard', author: 'my-articles', reviewer: 'my-reviews' };
+
+// ── NAVEGACIÓN ────────────────────────────────────────────────────────────
+let currentView   = '';
+let currentParams = {};
+let renderLock    = false;
+let pendingNav    = null;
+
+export function navigateTo(view, params = {}) {
+  currentView   = view;
+  currentParams = params;
+  document.querySelectorAll('.nav-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.view === view)
+  );
+  if (renderLock) { pendingNav = { view, params }; return; }
+  _doRender();
+}
+
+async function _doRender() {
+  if (renderLock) return;
+  renderLock = true;
+  pendingNav = null;
+  try {
+    const container = document.getElementById('viewContainer');
+    if (!container) return;
+    const viewMap = {
+      'dashboard':             EditorViews.renderDashboard,
+      'assign':                EditorViews.renderAssignView,
+      'article-detail':        EditorViews.renderArticleDetail,
+      'reviewers':             EditorViews.renderReviewersView,
+      'my-articles':           AuthorViews.renderAuthorArticles,
+      'article-form':          AuthorViews.renderArticleForm,
+      'author-article-detail': AuthorViews.renderAuthorArticleDetail,
+      'my-reviews':            ReviewerViews.renderReviewerDashboard,
+      'review-history':        ReviewerViews.renderReviewHistory,
+      'review-form':           ReviewerViews.renderReviewForm,
+      'review-detail':         ReviewerViews.renderReviewDetail,
+    };
+    const fn = viewMap[currentView];
+    if (fn) await fn(container, currentParams);
+    else    await EditorViews.renderDashboard(container);
+  } finally {
+    renderLock = false;
+    if (pendingNav) {
+      const { view, params } = pendingNav;
+      pendingNav = null;
+      navigateTo(view, params);
+    }
+  }
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────
+export function showToast(message, type = 'info') {
+  const container = document.getElementById('toastContainer');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  const icons = { success: '✓', error: '✗', info: 'ℹ', warning: '⚠' };
+  toast.innerHTML = `<span>${icons[type] || 'ℹ'}</span><span>${message}</span>`;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.style.animation = 'fadeOut 0.3s ease forwards';
+    setTimeout(() => toast.remove(), 300);
+  }, 3500);
+}
+
+// ── DATE HELPERS ──────────────────────────────────────────────────────────
+export function formatDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleDateString('es-MX', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+export function daysUntil(ts) {
+  return Math.ceil((ts - Date.now()) / (1000 * 60 * 60 * 24));
+}
+
+// ── SYNC BADGE ────────────────────────────────────────────────────────────
+export async function updateSyncBadge() {
+  const badge = document.getElementById('syncBadge');
+  const dot   = badge?.querySelector('.sync-dot');
+  const label = document.getElementById('syncLabel');
+  if (!dot || !label) return;
+  const pending = await getPendingCount();
+  const online  = isOnline();
+  if (!online) {
+    dot.className = 'sync-dot offline';
+    label.textContent = 'Offline';
+    document.getElementById('offlineBar')?.classList.remove('hidden');
+  } else if (pending > 0) {
+    dot.className = 'sync-dot pending';
+    label.textContent = `${pending} pendientes`;
+    document.getElementById('offlineBar')?.classList.add('hidden');
+  } else {
+    dot.className = 'sync-dot online';
+    label.textContent = 'Sincronizado';
+    document.getElementById('offlineBar')?.classList.add('hidden');
+  }
+}
+
+async function updateSyncPanel() {
+  const list = document.getElementById('syncQueueList');
+  if (!list) return;
+  const pending = await SyncQueueRepo.getPending();
+  list.innerHTML = pending.length === 0
+    ? '<div class="empty-sync">✓ No hay operaciones pendientes</div>'
+    : pending.map(item => `
+        <div class="sync-queue-item">
+          <span class="op-type">${item.entity}</span>
+          <span>${item.operation} · ${new Date(item.createdAt).toLocaleTimeString('es-MX')}</span>
+        </div>`).join('');
+}
+
+// ── LOGIN / LOGOUT ────────────────────────────────────────────────────────
+function setupLoginLogout() {
+  const loginScreen = document.getElementById('loginScreen');
+  const mainApp     = document.getElementById('mainApp');
+  if (!loginScreen || !mainApp) return;
+
+  window.PeerFlowApp = {
+    async login(role) {
+      // Actualizar sesión
+      const user = DEMO_USERS[role];
+      currentRole   = role;
+      currentUser   = user;
+      session.role  = role;
+      session.user  = user;
+
+      loginScreen.style.display = 'none';
+      mainApp.style.display     = 'block';
+
+      // Badge de rol
+      const badge = document.getElementById('roleBadge');
+      if (badge) { badge.className = 'role-badge ' + role; badge.textContent = user.label; }
+
+      // Nombre de usuario en header
+      const userLabel = document.getElementById('userLabel');
+      if (userLabel) userLabel.textContent = user.name;
+
+      // Navegación
+      const nav = document.getElementById('mainNav');
+      if (nav) {
+        nav.innerHTML = NAV_ITEMS[role].map(i =>
+          `<button class="nav-btn" data-view="${i.view}">${i.label}</button>`
+        ).join('');
+        nav.querySelectorAll('.nav-btn').forEach(btn =>
+          btn.addEventListener('click', () => navigateTo(btn.dataset.view))
+        );
+      }
+
+      await updateSyncBadge();
+
+      if (isOnline()) {
+        const serverOk = await checkServerConnection();
+        if (serverOk) {
+          showToast('Cargando datos del servidor...', 'info');
+          const ok = await pullFromServer();
+          if (ok) showToast('Datos actualizados ✓', 'success');
+        }
+      }
+
+      navigateTo(DEFAULT_VIEW[role]);
+    },
+
+    logout() {
+      currentRole  = null;
+      currentUser  = null;
+      session.user = null;
+      session.role = null;
+      loginScreen.style.display = 'block';
+      mainApp.style.display     = 'none';
+    }
+  };
+}
+
+// ── SYNC BUTTON ───────────────────────────────────────────────────────────
+function setupSyncButton() {
+  document.getElementById('syncNowBtn')?.addEventListener('click', async () => {
+    if (!isOnline()) { showToast('Sin conexión al servidor', 'warning'); return; }
+    showToast('Sincronizando...', 'info');
+    const { synced, failed } = await syncNow();
+    await updateSyncBadge();
+    await updateSyncPanel();
+    if (failed > 0) showToast(`${synced} sincronizados, ${failed} fallaron`, 'warning');
+    else            showToast(`Sincronización completa (${synced})`, 'success');
+    const container = document.getElementById('viewContainer');
+    if (container && currentView) navigateTo(currentView, currentParams);
+  });
+}
+
+// ── SYNC PANEL ────────────────────────────────────────────────────────────
+function setupSyncPanel() {
+  const badge = document.getElementById('syncBadge');
+  const panel = document.getElementById('syncPanel');
+  if (!badge || !panel) return;
+  badge.addEventListener('click', async () => {
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) await updateSyncPanel();
+  });
+  document.addEventListener('click', e => {
+    if (!badge.contains(e.target) && !panel.contains(e.target)) panel.classList.add('hidden');
+  });
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  setupLoginLogout();
+  setupSyncButton();
+  setupSyncPanel();
+
+  onSyncEvent('status-change', async ({ online }) => {
+    await updateSyncBadge();
+    if (online) scheduleSync(1000);
+  });
+  onSyncEvent('sync-complete', async () => {
+    await updateSyncBadge();
+    await updateSyncPanel();
+  });
+  onSyncEvent('pull-complete', () => updateSyncBadge());
+
+  setInterval(async () => {
+    if (isOnline()) { await syncNow(); await updateSyncBadge(); }
+  }, 120_000);
+
+  updateSyncBadge();
+});
